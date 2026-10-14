@@ -5,7 +5,7 @@ An authenticated client submits a request. Each approver gets an email with one 
 
 ## Levels
 
-Defined once, in `ApprovalLevels.cs`.
+The levels and the actions they offer are defined in `ApprovalLevels.cs`. The transitions between them are the connections of the flowchart below.
 
 | Level | Role          | Who acts                         | Actions offered                                     |
 |-------|---------------|----------------------------------|-----------------------------------------------------|
@@ -22,34 +22,49 @@ The rules:
 
 ## Flow
 
+The workflow (`Workflows/TieredApprovalWorkflow.cs`) is a `Flowchart`, so Elsa Studio draws it (see [Watching it in Elsa Studio](#watching-it-in-elsa-studio)).
+Each node has a fixed id, a readable name and a designer position.
+
 ```mermaid
-flowchart TD
-    A["POST /workflows/tiered-approval/requests<br/>(authenticated)"] --> V{valid payload?}
-    V -- no --> R400[400 + error list]
-    V -- yes --> R202["202 { workflowInstanceId }"]
-    R202 --> S[email requester: submitted]
-    S --> L["currentLevel = 20, status = Pending"]
-    L --> W{status == Pending?}
-    W -- yes --> STEP["ApprovalStep(currentLevel)<br/>email assignee one link per action, then wait"]
-    STEP -- Approve --> T1{"level 40?"}
-    T1 -- yes --> AP[status = Approved]
-    T1 -- no --> NX[currentLevel = next level]
-    STEP -- Reject --> RJ["status = Rejected<br/>(Withdrawn at 10)"]
-    STEP -- "Revision(target)" --> RV[currentLevel = target]
-    AP --> W
-    NX --> W
-    RJ --> W
-    RV --> W
-    W -- no --> F["final email to requester, CC approvers who acted:<br/>outcome + history table"]
+flowchart LR
+    SUB["Submit request<br/>POST /workflows/tiered-approval/requests<br/>(authenticated)"] -- "Done, Request too large" --> VAL{Valid request?}
+    VAL -- False --> R400["Respond 400<br/>error list"]
+    VAL -- True --> ES[Email requester: submitted]
+    ES --> R202["Respond 202<br/>{ workflowInstanceId }"]
+    R202 --> SH["Section Head (20)"]
+    SH -- Approve --> DH["Dept Head (30)"]
+    DH -- Approve --> DV["Division Head (40)"]
+    DV -- Approve --> EA["Email: approved<br/>to requester, CC approvers who acted"]
+    ST["Staff (10)"] -- "Approve (Resubmit)" --> SH
+    ST -- "Reject (Withdraw)" --> ER["Email: rejected<br/>subject Withdrawn if Staff withdrew"]
+    SH -- Reject --> ER
+    DH -- Reject --> ER
+    DV -- Reject --> ER
+    SH -- Revision --> SB{"Send back to<br/>(decision's target level)"}
+    DH -- Revision --> SB
+    DV -- Revision --> SB
+    SB -- 10 --> ST
+    SB -- 20 --> SH
+    SB -- 30 --> DH
 ```
 
-`ApprovalStep` (`Activities/ApprovalStep.cs`) is a blocking `Activity<ApprovalDecision>` marked `[FlowNode("Approve", "Reject", "Revision")]`, so it can also be used in a designer flowchart.
+`ApprovalStep` (`Activities/ApprovalStep.cs`) is a blocking `Activity<ApprovalDecision>` marked `[FlowNode("Approve", "Reject", "Revision")]`. The four approval nodes are instances of it, one per level.
 For each offered action it creates one bookmark and stores `{action, targetLevel, label, levelName, title}` in the bookmark metadata, on the server.
 It then emails a signed link per bookmark (7-day lifetime), together with the request history so far.
 
 When a link is used, the named callback reads the action from the resumed bookmark's metadata and the optional `comment` from the resume input. A comment that is not a string is ignored.
 It sets `Result` and completes with the action as its outcome. Completing removes the sibling bookmarks, so the other buttons in that email stop working.
 Resumes of one request run one at a time, under a per-instance lock (`UseDistributedRuntime`), so two buttons confirmed at the same moment cannot both take effect.
+
+Each step records its own decision. The `History` input is bound to the `History` variable, and the `UpdatedHistory` output is bound to the same variable.
+That output receives a new list: the old history plus this decision. Both bindings are plain variable references, so they are serialized with the definition and show in Studio.
+The history is persisted with the instance. It feeds the next approver's email, the "Send back to" switch (which reads the last decision's target level) and the final email.
+
+The flowchart loops back to earlier nodes along several paths. Several nodes have more than one inbound connection: Section Head, Dept Head, "Send back to" and "Email: rejected".
+The host therefore enables token-based flowchart execution: `UseFlowchart(f => f.UseTokenBasedExecution())`, as `Elsa.Server.Web` does.
+The default counter-based mode rejects the "Send back to -> Dept Head" back edge with "Invalid backward connection". With that mode the smoke test fails at request F.
+Every node keeps the default merge mode. In token mode that mode schedules a node when a token arrives on one of its connections and no node that feeds it is still waiting to run.
+Only one step is ever pending, so each node runs exactly once per arriving token. The smoke test checks this against the instance journal and the per-node execution counts.
 
 ## Run
 
@@ -60,6 +75,8 @@ dotnet run --project src/apps/Elsa.TieredApproval.Web    # http://localhost:5180
 ```
 
 In Development, mail is not sent. Each message is written as an `.eml` file to `src/apps/Elsa.TieredApproval.Web/App_Data/mail`; open one with Outlook or any mail client. The Sqlite database is `App_Data/elsa.sqlite.db`.
+
+Upgrading from the earlier Sequence version, or changing the workflow's structure later: finish or cancel open requests, or delete `App_Data`, before starting the new build. The code-first definition keeps the id `TieredApprovalWorkflow:v1` and every instance is resumed against the current class, so requests still in flight cannot continue. Their links still open the confirm page and the resume returns 200, but nothing runs and no email is sent.
 
 Start a request:
 
@@ -93,25 +110,57 @@ Content-Type: application/json
 {"input":{"comment":"optional text"}}
 ```
 
+### Watching it in Elsa Studio
+
+Start this server first, then the Studio host in `src/apps/Elsa.TieredApproval.Studio`:
+
+```powershell
+dotnet run --project src/apps/Elsa.TieredApproval.Web       # 1. server, http://localhost:5180
+dotnet run --project src/apps/Elsa.TieredApproval.Studio    # 2. Studio, http://localhost:5190
+```
+
+Open http://localhost:5190 and sign in as `admin` / `password`.
+
+- **Workflows > Definitions > Tiered approval** shows the diagram above. The definition is code-first, so Studio opens it read-only: it offers no publish (`builder.AsReadonly()`).
+- **Workflows > Instances** lists the runs. Open one to see the path it took highlighted on the diagram, and its journal.
+
+For Studio, the server also enables:
+
+- the dashboard API (`UseDashboardApi()`, `UseWorkflowRuntimeDashboard()`), for the home page widgets;
+- real-time instance updates (`UseRealTimeWorkflows()`, `app.UseWorkflowsSignalRHubs()`). The hub at `/elsa/hubs/workflow-instance` requires an authenticated caller. Studio sends its access token, and anonymous callers get 401.
+
 ### Smoke test
 
 ```powershell
-pwsh -File src/apps/Elsa.TieredApproval.Web/smoke-test.ps1            # -Port 5190 if 5180 is busy
+pwsh -File src/apps/Elsa.TieredApproval.Web/smoke-test.ps1                      # app on 5180, Studio on 5190
+pwsh -File src/apps/Elsa.TieredApproval.Web/smoke-test.ps1 -Port 5280           # if 5180 is busy (Studio on 5290)
+pwsh -File src/apps/Elsa.TieredApproval.Web/smoke-test.ps1 -WithStudio:$false   # skip the Studio host
 ```
 
 The script does the following:
 
-1. Builds the app and starts it with a fresh `App_Data`.
-2. Checks that an unauthenticated start returns 401. Checks that an invalid, malformed or oversized payload returns the app's 400 error list, and that the instance still finishes.
-3. Drives three requests through the real endpoints, using the `.eml` files:
+1. Builds the app and the Studio host, then starts the app with a fresh `App_Data`.
+2. Checks the API that Studio uses:
+   - The definition is an `Elsa.Flowchart` with the 12 nodes, the 20 connections, a label and a distinct position for every node, the History bindings on every approval step, and no publish link.
+   - The activity descriptors include `ApprovalStep`.
+   - The installed features, the dashboard overview and the `admin` / `password` login all answer.
+   - The login token is accepted by the API and by the real-time hub. The hub refuses anonymous callers.
+3. Starts the Studio host against the app. Checks that its home page, its sign-in page and its Blazor circuit endpoint answer, then stops it. Signing in itself needs a browser.
+4. Checks that an unauthenticated start returns 401. Checks that an invalid, malformed or oversized payload returns the app's 400 error list, and that the instance still finishes.
+5. Drives six requests through the real endpoints, using the `.eml` files:
    - Request A: 20 Approve, 30 Revision to 10, 10 Resubmit, 20 Approve, 30 Approve, 40 Revision to 20, 20 Approve, 30 Approve, 40 Approve. Result: Approved.
+     After "30 Revision to 10", the script kills the app and starts a new process on the same `App_Data`. The rest of the request must therefore come from Sqlite.
+     At the end it checks that the instance journal and the execution report (what Studio highlights) list each node once per visit, in order.
    - Request B: 20 Reject. Result: Rejected.
+   - Request D: 20 Approve, 30 Approve, 40 Reject. Result: Rejected, CC 20, 30 and 40.
+   - Request E: 20 Revision to 10, 10 Withdraw. Result: Withdrawn.
+   - Request F: 20 Approve, 30 Approve, 40 Revision to 30, 30 Approve, 40 Approve. Result: Approved.
    - Request C: 20 Approve and Reject confirmed at the same time. Exactly one of them may take effect.
-4. At every step, checks that the revision targets offered are exactly the lower levels.
-5. Checks that the confirm page GET does not act on the request, and that a GET of the resume URL embedded in the page is refused.
-6. Checks that a used link and its sibling links do not move the workflow, and that a non-string comment does not fault it.
-7. Checks that user text is HTML-encoded in the emails and on the confirm page.
-8. Stops the app, whatever the outcome. The script exits non-zero on any failure.
+6. At every step, checks that the revision targets offered are exactly the lower levels.
+7. Checks that the confirm page GET does not act on the request, and that a GET of the resume URL embedded in the page is refused.
+8. Checks that a used link and its sibling links do not move the workflow, and that a non-string comment does not fault it.
+9. Checks that user text is HTML-encoded in the emails and on the confirm page.
+10. Stops the app and Studio, whatever the outcome. The script exits non-zero on any failure.
 
 ## Switching to a real SMTP server
 

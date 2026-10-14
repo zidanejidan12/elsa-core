@@ -40,8 +40,11 @@ public class ApprovalStep : Activity<ApprovalDecision>
     [Input(Description = "Optional note shown to the assignee, e.g. why the request came back.")]
     public Input<string?> ContextNote { get; set; } = null!;
 
-    [Input(Description = "Optional decisions taken so far, shown to the assignee as a table.")]
+    [Input(Description = "Decisions taken so far: shown to the assignee as a table, and the base of Updated history.")]
     public Input<ICollection<ApprovalDecision>?> History { get; set; } = null!;
+
+    [Output(Description = "A new list: History plus this step's decision. Bind it to the history variable to record the decision.")]
+    public Output<ICollection<ApprovalDecision>>? UpdatedHistory { get; set; }
 
     protected override async ValueTask ExecuteAsync(ActivityExecutionContext context)
     {
@@ -106,6 +109,8 @@ public class ApprovalStep : Activity<ApprovalDecision>
         };
 
         Result.Set(context, decision);
+        // A new list, never the input's: that may be the variable's shared default value.
+        UpdatedHistory.Set(context, new List<ApprovalDecision>(History.GetOrDefault(context) ?? []) { decision });
 
         // Completing clears the sibling bookmarks, so the other links of this email stop working too.
         await context.CompleteActivityWithOutcomesAsync(action);

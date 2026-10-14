@@ -1,13 +1,15 @@
 #requires -Version 7
 <#
 .SYNOPSIS
-    End-to-end smoke test: builds the app, starts it with a fresh App_Data, drives two requests through the real HTTP
-    endpoints using the .eml files from the pickup directory, and always stops the app. Exits non-zero on any failure.
+    End-to-end smoke test: builds the app, starts it with a fresh App_Data, checks the API Elsa Studio uses, drives six
+    requests through the real HTTP endpoints using the .eml files from the pickup directory (restarting the app half way
+    through one of them), briefly runs the Studio host, and always stops everything. Exits non-zero on any failure.
 .EXAMPLE
-    pwsh -File smoke-test.ps1            # http://localhost:5180
-    pwsh -File smoke-test.ps1 -Port 5190 # if 5180 is busy
+    pwsh -File smoke-test.ps1                      # app on http://localhost:5180, Studio on 5190
+    pwsh -File smoke-test.ps1 -Port 5280           # if 5180 is busy (Studio then uses 5290)
+    pwsh -File smoke-test.ps1 -WithStudio:$false   # skip building and starting the Studio host
 #>
-param([int]$Port = 5180)
+param([int]$Port = 5180, [switch]$WithStudio = $true)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -21,6 +23,8 @@ $base = "http://localhost:$Port"
 $auth = @{ Authorization = 'ApiKey 00000000-0000-0000-0000-000000000000' }
 $logOut = Join-Path ([IO.Path]::GetTempPath()) "tiered-approval-smoke-$Port.out.log"
 $logErr = Join-Path ([IO.Path]::GetTempPath()) "tiered-approval-smoke-$Port.err.log"
+$studioDir = Join-Path $appDir '../Elsa.TieredApproval.Studio'
+$studioBase = "http://localhost:$($Port + 10)"
 $seen = [System.Collections.Generic.HashSet[string]]::new()
 
 $people = @{
@@ -153,25 +157,9 @@ function Wait-Final([string]$InstanceId, [string]$Status, [int[]]$CcLevels, [int
     Assert (@(Get-NewMail $InstanceId).Count -eq 0) 'no further emails after the final one'
 }
 
-$failed = $false
-$process = $null
-$savedEnv = @{}
-
-try {
-    if (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue) { throw "Port $Port is busy; rerun with -Port <free port>." }
-
-    Write-Host "== build"
-    dotnet build $project --nologo -v q --disable-build-servers # leaves no MSBuild/compiler server processes behind
-    if ($LASTEXITCODE -ne 0) { throw 'dotnet build failed.' }
-
-    Write-Host "== start app on $base (fresh App_Data)"
-    if (Test-Path $appData) { Remove-Item $appData -Recurse -Force }
-    foreach ($pair in @{ ASPNETCORE_ENVIRONMENT = 'Development'; ASPNETCORE_URLS = $base; Http__BaseUrl = $base }.GetEnumerator()) {
-        $savedEnv[$pair.Key] = [Environment]::GetEnvironmentVariable($pair.Key)
-        [Environment]::SetEnvironmentVariable($pair.Key, $pair.Value)
-    }
-    $process = Start-Process dotnet -ArgumentList "`"$dll`"" -WorkingDirectory $appDir -PassThru -NoNewWindow -RedirectStandardOutput $logOut -RedirectStandardError $logErr
-
+# Starts the app on the current App_Data and waits until it serves requests.
+function Start-App {
+    $script:process = Start-Process dotnet -ArgumentList "`"$dll`"" -WorkingDirectory $appDir -PassThru -NoNewWindow -RedirectStandardOutput $logOut -RedirectStandardError $logErr
     $deadline = (Get-Date).AddSeconds(120)
     while ($true) {
         if ($process.HasExited) { throw "App exited during startup (code $($process.ExitCode))." }
@@ -179,7 +167,96 @@ try {
         if ((Get-Date) -gt $deadline) { throw 'App did not respond within 120 s.' }
         Start-Sleep -Milliseconds 500
     }
-    Write-Host '  ok  app is up'
+    Write-Host "  ok  app is up (process $($process.Id))"
+}
+
+function Stop-Proc($Process) {
+    if ($Process -and -not $Process.HasExited) { Stop-Process -Id $Process.Id -Force; $Process.WaitForExit(10000) | Out-Null }
+}
+
+$failed = $false
+$process = $null
+$studio = $null
+$savedEnv = @{}
+
+try {
+    foreach ($p in @($Port) + @(if ($WithStudio) { $Port + 10 })) {
+        if (Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue) { throw "Port $p is busy; rerun with -Port <free port>." }
+    }
+
+    Write-Host "== build"
+    foreach ($proj in @($project) + @(if ($WithStudio) { Join-Path $studioDir 'Elsa.TieredApproval.Studio.csproj' })) {
+        dotnet build $proj --nologo -v q --disable-build-servers # leaves no MSBuild/compiler server processes behind
+        if ($LASTEXITCODE -ne 0) { throw "dotnet build $proj failed." }
+    }
+
+    Write-Host "== start app on $base (fresh App_Data)"
+    if (Test-Path $appData) { Remove-Item $appData -Recurse -Force }
+    foreach ($pair in @{ ASPNETCORE_ENVIRONMENT = 'Development'; ASPNETCORE_URLS = $base; Http__BaseUrl = $base }.GetEnumerator()) {
+        $savedEnv[$pair.Key] = [Environment]::GetEnvironmentVariable($pair.Key)
+        [Environment]::SetEnvironmentVariable($pair.Key, $pair.Value)
+    }
+    Start-App
+
+    Write-Host '== API used by Elsa Studio'
+    # The designer draws a Flowchart root from its nodes (label = name, position = metadata.designer.position) and connections.
+    $response = Invoke-Http Get "$base/elsa/api/workflow-definitions/by-definition-id/TieredApprovalWorkflow?versionOptions=Latest" -Headers $auth
+    Assert ($response.StatusCode -eq 200) "definition by id returns 200 ($($response.StatusCode))"
+    $definition = $response.Content | ConvertFrom-Json
+    Assert ($definition.root.type -eq 'Elsa.Flowchart') "the root is a flowchart ($($definition.root.type))"
+    $nodes = 'SubmitRequest', 'ValidRequest', 'Respond400', 'EmailSubmitted', 'Respond202', 'Staff', 'SectionHead', 'DeptHead', 'DivisionHead', 'SendBackTo', 'EmailApproved', 'EmailRejected'
+    $activities = @($definition.root.activities)
+    Assert ((($activities.id | Sort-Object) -join ',') -eq (($nodes | Sort-Object) -join ',')) "the flowchart has the 12 expected nodes (got $($activities.id -join ','))"
+    $placed = @($activities | Where-Object { try { $_.name -and $_.metadata.designer.position.x -is [ValueType] -and $_.metadata.designer.position.y -is [ValueType] } catch { $false } })
+    Assert ($placed.Count -eq $nodes.Count) "every node has a label and a designer position ($($placed.Count)/$($nodes.Count))"
+    # Studio sizes a node to its label (~280px for 'Email requester: submitted') and draws out-port labels past its right edge.
+    $crowded = @($activities | Group-Object { $_.metadata.designer.position.y } | ForEach-Object {
+            $xs = @($_.Group.metadata.designer.position.x | Sort-Object)
+            for ($i = 1; $i -lt $xs.Count; $i++) { if ($xs[$i] - $xs[$i - 1] -lt 340) { "x $($xs[$i - 1])/$($xs[$i]) at y $($_.Name)" } }
+        })
+    Assert ($crowded.Count -eq 0) "no two nodes share a position and nodes in a row are at least 340px apart ($($crowded -join '; '))"
+    $edges = @($definition.root.connections | ForEach-Object { "$($_.source.activity):$($_.source.port)>$($_.target.activity)" })
+    $expectedEdges = @(
+        'SubmitRequest:Done>ValidRequest', 'SubmitRequest:Request too large>ValidRequest', 'ValidRequest:False>Respond400', 'ValidRequest:True>EmailSubmitted',
+        'EmailSubmitted:Done>Respond202', 'Respond202:Done>SectionHead', 'SectionHead:Approve>DeptHead', 'DeptHead:Approve>DivisionHead',
+        'DivisionHead:Approve>EmailApproved', 'Staff:Approve>SectionHead', 'Staff:Reject>EmailRejected', 'SectionHead:Reject>EmailRejected',
+        'DeptHead:Reject>EmailRejected', 'DivisionHead:Reject>EmailRejected', 'SectionHead:Revision>SendBackTo', 'DeptHead:Revision>SendBackTo',
+        'DivisionHead:Revision>SendBackTo', 'SendBackTo:10>Staff', 'SendBackTo:20>SectionHead', 'SendBackTo:30>DeptHead')
+    Assert ((($edges | Sort-Object) -join '|') -eq (($expectedEdges | Sort-Object) -join '|')) "the flowchart has the 20 expected connections (got $($edges -join ', '))"
+    $steps = @($activities | Where-Object type -eq 'TieredApproval.ApprovalStep')
+    $unbound = @($steps | Where-Object { $_.history.expression.value.name -ne 'History' -or $_.updatedHistory.memoryReference.id -ne $_.history.expression.value.id })
+    Assert ($steps.Count -eq 4 -and $unbound.Count -eq 0) 'each approval step reads the History variable and writes it back (serializable bindings, no Inline)'
+    Assert ($definition.isReadonly -and $definition.links.rel -notcontains 'publish') 'the code-first definition is read-only in Studio (no publish link)'
+    $descriptors = Invoke-Http Get "$base/elsa/api/descriptors/activities" -Headers $auth
+    Assert ($descriptors.StatusCode -eq 200 -and (($descriptors.Content | ConvertFrom-Json).items.typeName -contains 'TieredApproval.ApprovalStep')) 'activity descriptors include ApprovalStep'
+    $features = Invoke-Http Get "$base/elsa/api/features/installed" -Headers $auth
+    $installed = @(($features.Content | ConvertFrom-Json).items.fullName)
+    Assert ($features.StatusCode -eq 200 -and $installed -contains 'Elsa.RealTimeWorkflowUpdates' -and $installed -contains 'Elsa.DashboardApi') 'installed features (200) include real-time updates and the dashboard API'
+    $dashboard = Invoke-Http Get "$base/elsa/api/dashboard/overview" -Headers $auth
+    Assert ($dashboard.StatusCode -eq 200) "dashboard overview returns 200 ($($dashboard.StatusCode))"
+    # Studio's sign-in: admin/password against Backend:Url, then a bearer token on every API call and on the real-time hub.
+    $login = Invoke-Http Post "$base/elsa/api/identity/login" @{ username = 'admin'; password = 'password' }
+    $token = try { ($login.Content | ConvertFrom-Json).accessToken } catch { $null }
+    Assert ($login.StatusCode -eq 200 -and $token) "login admin/password returns an access token ($($login.StatusCode))"
+    $bearer = @{ Authorization = "Bearer $token" }
+    $list = Invoke-Http Get "$base/elsa/api/workflow-definitions" -Headers $bearer
+    Assert ($list.StatusCode -eq 200 -and (($list.Content | ConvertFrom-Json).items.definitionId -contains 'TieredApprovalWorkflow')) 'with the token, the definitions list shows the workflow'
+    Assert ((Invoke-Http Post "$base/elsa/hubs/workflow-instance/negotiate?negotiateVersion=1" -Headers $bearer).StatusCode -eq 200) 'with the token, the real-time hub accepts the connection'
+    Assert ((Invoke-Http Post "$base/elsa/hubs/workflow-instance/negotiate?negotiateVersion=1").StatusCode -eq 401) 'the real-time hub refuses anonymous callers (401)'
+
+    if ($WithStudio) {
+        Write-Host "== Studio host on $studioBase (backend $base/elsa/api)"
+        # Command-line settings win over the environment, which still carries the app's ASPNETCORE_URLS.
+        $studio = Start-Process dotnet -ArgumentList "`"$(Join-Path $studioDir 'bin/Debug/net10.0/Elsa.TieredApproval.Studio.dll')`"", "--urls=$studioBase", "--Backend:Url=$base/elsa/api" -WorkingDirectory $studioDir -PassThru -NoNewWindow -RedirectStandardOutput "$logOut.studio" -RedirectStandardError "$logErr.studio"
+        $deadline = (Get-Date).AddSeconds(60)
+        do { $studioHome = try { Invoke-WebRequest $studioBase -SkipHttpErrorCheck -TimeoutSec 10 } catch { $null }; if ($studioHome -or $studio.HasExited) { break }; Start-Sleep -Milliseconds 250 } while ((Get-Date) -lt $deadline)
+        Assert ($studioHome -and $studioHome.StatusCode -eq 200 -and $studioHome.Content.Contains('<title>Elsa Studio</title>')) "Studio home page renders (200)"
+        $signIn = Invoke-Http Get "$studioBase/login"
+        Assert ($signIn.StatusCode -eq 200 -and $signIn.Content -match 'username' -and $signIn.Content -match 'password') 'Studio sign-in page renders with username and password fields (200)'
+        Assert ((Invoke-Http Post "$studioBase/_blazor/negotiate?negotiateVersion=1").StatusCode -eq 200) 'Studio accepts the Blazor circuit the sign-in form runs over'
+        Stop-Proc $studio
+        Write-Host '  Studio stopped'
+    }
 
     Write-Host '== start endpoint guards'
     $valid = @{ title = 'x'; requester = $people[10]; approvers = @{ '20' = $people[20]; '30' = $people[30]; '40' = $people[40] } }
@@ -219,6 +296,15 @@ try {
     Assert (@(Get-NewMail $a).Count -eq $pending) "reusing a used token ($($reuse.StatusCode)) or a sibling token ($($sibling.StatusCode)) does not advance the workflow"
     Assert ((Invoke-Http Get $first.Link.Url).StatusCode -eq 410) 'confirm page reports a used link as gone (410)'
 
+    # A new process on the same App_Data: the rest of request A (bookmarks, variables, history) can only come from SQLite.
+    Write-Host '== restart the app (hard kill) while request A waits at Staff'
+    $before = $process.Id
+    Stop-Proc $process
+    Start-App
+    Assert ($process.Id -ne $before) "the app runs as a new process ($before -> $($process.Id))"
+    $state = Wait-InstanceState $a 'Running/Suspended'
+    Assert ($state -eq 'Running/Suspended') "request A is still suspended after the restart ($state)"
+
     Invoke-Step $a 10 Approve -Comment $true | Out-Null # Resubmit; a non-string comment is ignored, not a fault
     Invoke-Step $a 20 Approve | Out-Null
     Invoke-Step $a 30 Approve | Out-Null
@@ -229,10 +315,44 @@ try {
     Assert ([regex]::Matches($last.Mail.Body, '<tr><td>').Count -eq 8) 'action email shows the 8 decisions so far'
     Wait-Final $a 'Approved' @(20, 30, 40) 9
 
+    # What Studio's instance view shows: the journal (timeline) and per-node execution counts (the highlighted path).
+    # Each node must run exactly once per arriving token, also where several paths and loops merge.
+    $journal = (Invoke-Http Get "$base/elsa/api/workflow-instances/$a/journal" -Headers $auth).Content | ConvertFrom-Json
+    $path = @($journal.items | Where-Object { $_.eventName -eq 'Completed' -and $_.activityId -in $nodes } | ForEach-Object activityId)
+    $expectedPath = 'SubmitRequest', 'ValidRequest', 'EmailSubmitted', 'Respond202', 'SectionHead', 'DeptHead', 'SendBackTo', 'Staff',
+        'SectionHead', 'DeptHead', 'DivisionHead', 'SendBackTo', 'SectionHead', 'DeptHead', 'DivisionHead', 'EmailApproved'
+    Assert (($path -join ',') -eq ($expectedPath -join ',')) "journal lists the nodes request A ran, in order, across the restart (got $($path -join ','))"
+    $report = Invoke-Http Post "$base/elsa/api/activity-executions/report" @{ workflowInstanceId = $a; activityNodeIds = @($activities.nodeId) } $auth
+    $counts = @(($report.Content | ConvertFrom-Json).stats | Where-Object completedCount -gt 0 | ForEach-Object { "$($_.activityId)=$($_.completedCount)" } | Sort-Object)
+    $expectedCounts = @('SubmitRequest=1', 'ValidRequest=1', 'EmailSubmitted=1', 'Respond202=1', 'SectionHead=3', 'DeptHead=3', 'DivisionHead=2', 'SendBackTo=2', 'Staff=1', 'EmailApproved=1' | Sort-Object)
+    Assert ($report.StatusCode -eq 200 -and ($counts -join ',') -eq ($expectedCounts -join ',')) "execution report highlights the nodes that ran, with their counts (got $($counts -join ','))"
+
     Write-Host '== request B: rejected by Section Head'
     $b = Start-Request 'Conference trip'
     Invoke-Step $b 20 Reject | Out-Null
     Wait-Final $b 'Rejected' @(20) 1
+
+    Write-Host '== request D: rejected by Division Head'
+    $d = Start-Request 'Budget'
+    Invoke-Step $d 20 Approve | Out-Null
+    Invoke-Step $d 30 Approve | Out-Null
+    Invoke-Step $d 40 Reject | Out-Null
+    Wait-Final $d 'Rejected' @(20, 30, 40) 3
+
+    Write-Host '== request E: withdrawn by the requester after a revision'
+    $e = Start-Request 'Training'
+    Invoke-Step $e 20 Revision 10 | Out-Null
+    Invoke-Step $e 10 Reject | Out-Null # Withdraw
+    Wait-Final $e 'Withdrawn' @(20) 2
+
+    Write-Host '== request F: Division Head sends it back to Dept Head'
+    $f = Start-Request 'Monitor'
+    Invoke-Step $f 20 Approve | Out-Null
+    Invoke-Step $f 30 Approve | Out-Null
+    Invoke-Step $f 40 Revision 30 | Out-Null
+    Invoke-Step $f 30 Approve | Out-Null
+    Invoke-Step $f 40 Approve | Out-Null
+    Wait-Final $f 'Approved' @(20, 30, 40) 5
 
     Write-Host '== request C: Approve and Reject confirmed at the same time'
     $c = Start-Request 'Race'
@@ -256,10 +376,11 @@ catch {
     $failed = $true
     Write-Host "SMOKE TEST FAILED: $($_.Exception.Message)" -ForegroundColor Red
     Write-Host $_.ScriptStackTrace
-    foreach ($log in $logOut, $logErr) { if (Test-Path $log) { Write-Host "--- $log (tail)"; Get-Content $log -Tail 40 } }
+    foreach ($log in @($logOut, $logErr) + @(if ($studio) { "$logOut.studio", "$logErr.studio" })) { if (Test-Path $log) { Write-Host "--- $log (tail)"; Get-Content $log -Tail 40 } }
 }
 finally {
-    if ($process -and -not $process.HasExited) { Stop-Process -Id $process.Id -Force; $process.WaitForExit(10000) | Out-Null }
+    Stop-Proc $studio
+    Stop-Proc $process
     foreach ($pair in $savedEnv.GetEnumerator()) { [Environment]::SetEnvironmentVariable($pair.Key, $pair.Value) }
     Write-Host '== app stopped'
 }

@@ -6,6 +6,7 @@ using Elsa.Persistence.EFCore.Modules.Management;
 using Elsa.Persistence.EFCore.Modules.Runtime;
 using Elsa.SasTokens.Contracts;
 using Elsa.TieredApproval.Web;
+using Elsa.Workflows.Activities.Flowchart.Extensions;
 using Elsa.Workflows.Api;
 using Elsa.Workflows.Runtime;
 using Elsa.Workflows.Runtime.Distributed.Extensions;
@@ -48,6 +49,8 @@ builder.Services.AddElsa(elsa => elsa
         if (isDevelopment)
             auth.UseDevelopmentAdminApiKey();
     })
+    // The workflow loops back to earlier steps along several paths; the default counter-based flowchart rejects such back edges.
+    .UseFlowchart(flowchart => flowchart.UseTokenBasedExecution())
     .UseWorkflowManagement(management => management.UseEntityFrameworkCore(ef => ef.UseSqlite(connectionString)))
     .UseWorkflowRuntime(runtime =>
     {
@@ -62,6 +65,10 @@ builder.Services.AddElsa(elsa => elsa
         runtime.DistributedLockProvider = _ => new FileDistributedSynchronizationProvider(new DirectoryInfo(Path.Combine(appData, "locks")));
     })
     .UseWorkflowsApi()
+    // For Elsa Studio: live instance updates over SignalR, and the dashboard widgets.
+    .UseRealTimeWorkflows()
+    .UseDashboardApi()
+    .UseWorkflowRuntimeDashboard()
     .UseHttp(http => http.ConfigureHttpOptions = options => configuration.GetSection("Http").Bind(options)));
 
 var app = builder.Build();
@@ -94,6 +101,8 @@ app.UseAuthentication();
 app.UseAuthorization();
 app.UseJsonSerializationErrorHandler();
 app.UseWorkflows();
+// Studio's instance viewer; the hub requires an authenticated caller, which Studio is (it sends its access token).
+app.UseWorkflowsSignalRHubs();
 
 // Landing page for emailed action links. Rendering only: the decision is taken by the page's POST to the Elsa resume endpoint.
 // The label, level and title come from the server-side bookmark, so a tampered link cannot relabel an action.

@@ -2,8 +2,10 @@
 
     <ItemGroup>
         <ProjectReference Include="..\..\modules\Elsa\Elsa.csproj" />
+        <ProjectReference Include="..\..\modules\Elsa.Dashboard.Api\Elsa.Dashboard.Api.csproj" />
         <ProjectReference Include="..\..\modules\Elsa.Http\Elsa.Http.csproj" />
         <ProjectReference Include="..\..\modules\Elsa.Persistence.EFCore.Sqlite\Elsa.Persistence.EFCore.Sqlite.csproj" />
+        <ProjectReference Include="..\..\modules\Elsa.Workflows.Runtime.Dashboard\Elsa.Workflows.Runtime.Dashboard.csproj" />
         <ProjectReference Include="..\..\modules\Elsa.Workflows.Runtime.Distributed\Elsa.Workflows.Runtime.Distributed.csproj" />
     </ItemGroup>
 
